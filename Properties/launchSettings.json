@@ -1,0 +1,9 @@
+{
+  "profiles": {
+    "search_indexer_skills": {
+      "commandName": "Project",
+      "commandLineArgs": "--port 7050",
+      "launchBrowser": false
+    }
+  }
+}
