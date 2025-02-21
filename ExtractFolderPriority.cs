@@ -54,7 +54,7 @@ namespace SearchServiceSkills
             {
                 int folderPriority = 999; // Default value if folder isn't found or parsed
 
-                if (record.Data != null && record.Data.TryGetValue("storage_path", out var storagePathObj))
+                if (record.Data != null && record.Data.TryGetValue("metadata_storage_path", out var storagePathObj))
                 {
                     string storagePath = storagePathObj?.ToString();
                     if (!string.IsNullOrEmpty(storagePath))
