@@ -1,10 +1,10 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Threading.Tasks;
-using Microsoft.AspNetCore.Http;
-using Microsoft.AspNetCore.Mvc;
 using Microsoft.Azure.Functions.Worker;
+using Microsoft.Azure.Functions.Worker.Http;
 using Microsoft.Extensions.Logging;
 using Newtonsoft.Json;
 
@@ -14,129 +14,124 @@ namespace SearchServiceSkills
     {
         private readonly ILogger<ExtractFolderPriority> _logger;
 
+        // Constructor DI
         public ExtractFolderPriority(ILogger<ExtractFolderPriority> logger)
         {
             _logger = logger;
         }
 
+        // ==== Function Entry Point ====
         [Function("ExtractFolderPriority")]
-        public async Task<IActionResult> Run(
-            [HttpTrigger(AuthorizationLevel.Function, "get", "post")] HttpRequest req)
+        public async Task<HttpResponseData> Run(
+            [HttpTrigger(AuthorizationLevel.Function, "post")] HttpRequestData req)
         {
-            _logger.LogInformation("ExtractFolderPriority function processed a request.");
-
-            // Read and verify the request body
             string requestBody = await new StreamReader(req.Body).ReadToEndAsync();
-            if (string.IsNullOrEmpty(requestBody))
-            {
-                return new BadRequestObjectResult("Request body is empty.");
-            }
+            SkillRequest skillRequest = JsonConvert.DeserializeObject<SkillRequest>(requestBody);
 
-            SkillRequest skillRequest;
-            try
-            {
-                skillRequest = JsonConvert.DeserializeObject<SkillRequest>(requestBody);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError("Error deserializing request: " + ex.Message);
-                return new BadRequestObjectResult("Invalid JSON format in request body.");
-            }
+            var response = req.CreateResponse();
 
-            // Prepare the skill response object
-            var response = new SkillResponse
-            {
-                Values = new List<SkillResponseRecord>()
-            };
+            // Load rules from App Settings
+            var rules = LoadRulesFromAppSettings();
+            int defaultPriority = LoadDefaultPriorityFromAppSettings();
 
-            // Process each record in the input
             foreach (var record in skillRequest.Values)
             {
-                int folderPriority = 999; // Default value if folder isn't found or parsed
+                // Get input field from the skill
+                string inputPath = record.Data.ContainsKey("path")
+                    ? record.Data["path"]?.ToString()
+                    : string.Empty;
 
-                if (record.Data != null && record.Data.TryGetValue("metadata_storage_path", out var storagePathObj))
-                {
-                    string storagePath = storagePathObj?.ToString();
-                    if (!string.IsNullOrEmpty(storagePath))
-                    {
-                        try
-                        {
-                            var uri = new Uri(storagePath);
-                            // Split the path into segments (ignoring empty entries)
-                            string[] segments = uri.AbsolutePath.Split(new[] { '/' }, StringSplitOptions.RemoveEmptyEntries);
+                int priority = CalculatePriority(inputPath, rules, defaultPriority);
 
-                            // Look for the "4142_Guides" segment
-                            int index = Array.FindIndex(segments, s => s.Equals("4142_Guides", StringComparison.OrdinalIgnoreCase));
-                            if (index >= 0 && index < segments.Length - 1)
-                            {
-                                // Get the folder name (the segment following "4142_Guides")
-                                string folderName = Uri.UnescapeDataString(segments[index + 1]);
-                                
-                                // Instead of a full dictionary lookup, extract the first 5 characters (e.g., "41420", "41421", etc.)
-                                if (folderName.Length >= 5 && folderName.StartsWith("4142"))
-                                {
-                                    string prefix = folderName.Substring(0, 5);
-                                    // Try to parse the 5th character as a digit.
-                                    if (int.TryParse(prefix.Substring(4, 1), out int digit))
-                                    {
-                                        // Set folderPriority to digit + 1. For example, "41420" (digit 0) becomes 1, "41421" (digit 1) becomes 2.
-                                        folderPriority = digit + 1;
-                                    }
-                                }
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            _logger.LogError($"Error processing storage_path '{storagePath}': {ex.Message}");
-                        }
-                    }
-                }
-
-                // Add the computed folderPriority to the response
-                response.Values.Add(new SkillResponseRecord
-                {
-                    RecordId = record.RecordId,
-                    Data = new Dictionary<string, object>
-                    {
-                        { "folderPriority", folderPriority }
-                    }
-                });
+                record.Data["priority"] = priority;
             }
 
-            // Return the result as JSON
-            return new OkObjectResult(response);
+            var skillResponse = new SkillResponse { Values = skillRequest.Values };
+            await response.WriteAsJsonAsync(skillResponse);
+
+            return response;
         }
-    }
 
-    // Models for the custom skill
+        // ==== RULE LOADING FROM APP SETTINGS ====
 
-    public class SkillRequest
-    {
-        [JsonProperty("values")]
-        public List<SkillRequestRecord> Values { get; set; }
-    }
+        private Dictionary<string, int> LoadRulesFromAppSettings()
+        {
+            string rawRules = Environment.GetEnvironmentVariable("FolderPriorityRules");
 
-    public class SkillRequestRecord
-    {
-        [JsonProperty("recordId")]
-        public string RecordId { get; set; }
+            if (string.IsNullOrWhiteSpace(rawRules))
+            {
+                _logger.LogWarning("FolderPriorityRules not defined in App Settings.");
+                return new Dictionary<string, int>();
+            }
 
-        [JsonProperty("data")]
-        public Dictionary<string, object> Data { get; set; }
-    }
+            // Format: "Guides:1;Manuals:5;Reports:20"
+            return rawRules
+                .Split(';', StringSplitOptions.RemoveEmptyEntries)
+                .Select(rule =>
+                {
+                    var parts = rule.Split(':', StringSplitOptions.TrimEntries);
+                    // parts[0] = folder name, parts[1] = priority
+                    return new
+                    {
+                        Key = parts[0],
+                        Value = int.TryParse(parts[1], out int p) ? p : 9999
+                    };
+                })
+                .ToDictionary(a => a.Key, a => a.Value, StringComparer.OrdinalIgnoreCase);
+        }
 
-    public class SkillResponse
-    {
-        [JsonProperty("values")]
-        public List<SkillResponseRecord> Values { get; set; }
-    }
+        private int LoadDefaultPriorityFromAppSettings()
+        {
+            string rawDefault = Environment.GetEnvironmentVariable("DefaultPriority");
 
-    public class SkillResponseRecord
-    {
-        [JsonProperty("recordId")]
-        public string RecordId { get; set; }
+            if (int.TryParse(rawDefault, out int val))
+                return val;
 
-        [JsonProperty("data")]
-        public Dictionary<string, object> Data { get; set; }
+            return 9999; // fallback default
+        }
+
+        // ==== PRIORITY LOGIC ====
+
+        private int CalculatePriority(
+            string path,
+            Dictionary<string, int> rules,
+            int defaultPriority)
+        {
+            if (string.IsNullOrWhiteSpace(path))
+                return defaultPriority;
+
+            foreach (var rule in rules)
+            {
+                if (path.Contains(rule.Key, StringComparison.OrdinalIgnoreCase))
+                {
+                    return rule.Value;
+                }
+            }
+
+            return defaultPriority;
+        }
+
+        // ==== DATA CONTRACTS ====
+
+        public class SkillRequest
+        {
+            [JsonProperty("values")]
+            public List<SkillRequestRecord> Values { get; set; }
+        }
+
+        public class SkillRequestRecord
+        {
+            [JsonProperty("recordId")]
+            public string RecordId { get; set; }
+
+            [JsonProperty("data")]
+            public Dictionary<string, object> Data { get; set; }
+        }
+
+        public class SkillResponse
+        {
+            [JsonProperty("values")]
+            public List<SkillRequestRecord> Values { get; set; }
+        }
     }
 }
