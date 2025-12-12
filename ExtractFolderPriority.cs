@@ -82,7 +82,7 @@ namespace SearchServiceSkills
 
         private int LoadDefaultPriorityFromAppSettings()
         {
-            string rawDefault = Environment.GetEnvironmentVariable("DefaultPriority");
+            string rawDefault = Environment.GetEnvironmentVariable("DefaultFolderPriority");
 
             if (int.TryParse(rawDefault, out int val))
                 return val;
